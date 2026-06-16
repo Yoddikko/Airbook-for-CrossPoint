@@ -5,60 +5,133 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @Environment(BookStore.self) private var store
+    @Environment(ReadingStateStore.self) private var readingStateStore
+    @Environment(CollectionsStore.self) private var collectionsStore
+    @Environment(MetadataLookupService.self) private var lookup
+    @Environment(ZLibService.self) private var zlib
     @State private var showingPicker = false
-    @State private var selectedBook: Book?
+    @State private var showingSync = false
+    @State private var showingDiscover = false
     @State private var importErrorMessage: String?
     @State private var showingImportError = false
+    @State private var scanner = DeviceScanner()
+    // Shared with SyncView (sheet) AND BookCardView (grid) so per-book status
+    // badges update live during an in-flight sync.
+    @State private var sync = SyncManager()
+    @State private var selectedBookID: UUID?
+    @State private var query = LibraryQuery()
+    @State private var showingDiagnostics = false
+
+    private var visibleBooks: [Book] {
+        query.apply(to: store.books,
+                    readingStateStore: readingStateStore,
+                    deviceStates: store.deviceStates)
+    }
+
+    private var availableFormats: [String] {
+        Array(Set(store.books.map(\.ext))).sorted()
+    }
 
     private let columns = [
-        GridItem(.flexible(), spacing: 16),
-        GridItem(.flexible(), spacing: 16)
+        GridItem(.flexible(), spacing: 12),
+        GridItem(.flexible(), spacing: 12)
     ]
 
     var body: some View {
         NavigationStack {
             ZStack {
-                Color.airBookBackground.ignoresSafeArea()
+                Color.paperBackground.ignoresSafeArea()
 
-                Group {
-                    if store.books.isEmpty {
-                        EmptyLibraryView { showingPicker = true }
-                    } else {
-                        ScrollView {
-                            LazyVGrid(columns: columns, spacing: 20) {
-                                ForEach(store.books) { book in
-                                    BookCardView(book: book)
-                                        .onTapGesture { selectedBook = book }
+                VStack(spacing: 0) {
+                    masthead
+                    connectionStatusBar
+
+                    Rectangle()
+                        .fill(Color.paperInk)
+                        .frame(height: 1.5)
+
+                    Rectangle()
+                        .fill(Color.paperRule.opacity(0.35))
+                        .frame(height: 0.5)
+                        .padding(.top, 2.5)
+
+                    if !store.books.isEmpty {
+                        LibraryToolbar(query: $query,
+                                       availableCollections: collectionsStore.collections,
+                                       availableFormats: availableFormats)
+                        Rectangle()
+                            .fill(Color.paperRule.opacity(0.35))
+                            .frame(height: 0.5)
+                    }
+
+                    Group {
+                        if store.books.isEmpty {
+                            EmptyLibraryView { showingPicker = true }
+                                .transition(.opacity)
+                        } else if visibleBooks.isEmpty {
+                            NoMatchView { query = LibraryQuery() }
+                                .transition(.opacity)
+                        } else {
+                            ScrollView {
+                                LazyVGrid(columns: columns, spacing: 16) {
+                                    ForEach(visibleBooks) { book in
+                                        Button {
+                                            selectedBookID = book.id
+                                        } label: {
+                                            BookCardView(book: book)
+                                        }
+                                        .buttonStyle(.plain)
                                         .contextMenu {
+                                            Button {
+                                                selectedBookID = book.id
+                                            } label: {
+                                                Label("Show Details", systemImage: "info.circle")
+                                            }
+                                            if store.hasFileOnDevice(book) {
+                                                Button {
+                                                    store.queueFileRemoval(book)
+                                                } label: {
+                                                    Label("Free Space on Device",
+                                                          systemImage: "tray.and.arrow.down")
+                                                }
+                                            }
                                             Button(role: .destructive) {
                                                 store.deleteBook(book)
                                             } label: {
                                                 Label("Delete", systemImage: "trash")
                                             }
                                         }
+                                    }
                                 }
+                                .padding(.horizontal, 16)
+                                .padding(.top, 16)
+                                .padding(.bottom, 40)
                             }
-                            .padding(.horizontal, 16)
-                            .padding(.top, 8)
-                            .padding(.bottom, 32)
+                            .transition(.opacity)
                         }
                     }
+                    .animation(.easeInOut(duration: 0.25), value: store.books.isEmpty)
+                    .animation(.easeInOut(duration: 0.2), value: visibleBooks.count)
                 }
             }
-            .navigationTitle("AirBook")
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button { showingPicker = true } label: {
-                        Image(systemName: "plus")
-                            .fontWeight(.semibold)
-                            .foregroundStyle(Color.airBookAccent)
-                    }
-                }
-            }
+            .toolbar(.hidden, for: .navigationBar)
+            .onAppear { scanner.startScan() }
+            .onDisappear { scanner.stopScan() }
         }
-        .sheet(item: $selectedBook) { book in
-            SendView(book: book)
+        .environment(sync)
+        .sheet(isPresented: $showingSync) {
+            SyncView()
                 .environment(store)
+                .environment(sync)
+        }
+        .sheet(isPresented: $showingDiscover) {
+            DiscoverView()
+                .environment(store)
+                .environment(sync)
+                .environment(readingStateStore)
+                .environment(collectionsStore)
+                .environment(lookup)
+                .environment(zlib)
         }
         .sheet(isPresented: $showingPicker) {
             DocumentPickerView { url in
@@ -70,10 +143,91 @@ struct ContentView: View {
                 }
             }
         }
+        .sheet(item: $selectedBookID) { id in
+            BookDetailView(bookID: id)
+                .environment(store)
+                .environment(sync)
+                .environment(readingStateStore)
+                .environment(collectionsStore)
+                .environment(lookup)
+        }
+        .sheet(isPresented: $showingDiagnostics) {
+            SyncDiagnosticsView()
+                .environment(sync)
+        }
         .alert("Import Failed", isPresented: $showingImportError) {
             Button("OK", role: .cancel) {}
         } message: {
             Text(importErrorMessage ?? "Unknown error")
+        }
+    }
+
+    // MARK: Masthead
+
+    private var masthead: some View {
+        HStack(alignment: .center, spacing: 8) {
+            Text("AirBook")
+                .font(.system(.title, design: .serif).weight(.bold))
+                .foregroundStyle(Color.paperInk)
+                .onLongPressGesture { showingDiagnostics = true }
+
+            // Connection status dot
+            Circle()
+                .fill(scanner.isNearby ? Color.paperInk : Color.paperRule.opacity(0.35))
+                .frame(width: 5, height: 5)
+                .animation(.easeInOut(duration: 0.4), value: scanner.isNearby)
+
+            Spacer()
+
+            // Discover (search & download from Z-Library)
+            Button { showingDiscover = true } label: {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Color.paperInk)
+                    .frame(width: 30, height: 30)
+                    .overlay(Rectangle().stroke(Color.paperInk, lineWidth: 0.8))
+            }
+
+            // Sync button
+            Button { showingSync = true } label: {
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Color.paperInk)
+                    .frame(width: 30, height: 30)
+                    .overlay(Rectangle().stroke(Color.paperInk, lineWidth: 0.8))
+            }
+
+            // Add book button
+            Button { showingPicker = true } label: {
+                Image(systemName: "plus")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Color.paperInk)
+                    .frame(width: 30, height: 30)
+                    .overlay(Rectangle().stroke(Color.paperInk, lineWidth: 0.8))
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 14)
+    }
+
+    // MARK: Connection status bar
+
+    @ViewBuilder
+    private var connectionStatusBar: some View {
+        if scanner.isNearby || scanner.isScanning {
+            HStack(spacing: 6) {
+                if scanner.isScanning && !scanner.isNearby {
+                    ProgressView().scaleEffect(0.5).tint(Color.paperRule)
+                }
+                Text(scanner.isNearby ? "CrossPoint nearby" : "Searching...")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(Color.paperRule)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 20)
+            .padding(.bottom, 6)
+            .transition(.opacity.combined(with: .move(edge: .top)))
+            .animation(.easeInOut(duration: 0.3), value: scanner.isNearby)
         }
     }
 }
@@ -81,98 +235,130 @@ struct ContentView: View {
 // MARK: - Book Card
 
 struct BookCardView: View {
+    @Environment(BookStore.self) private var store
+    @Environment(SyncManager.self) private var sync
     let book: Book
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        let status = store.libraryStatus(for: book, sync: sync)
+        let author = book.metadata.author?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        VStack(alignment: .leading, spacing: 6) {
             BookCoverView(book: book)
-                .shadow(color: .black.opacity(0.18), radius: 8, x: 0, y: 4)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(book.displayTitle)
-                    .font(.caption.weight(.semibold))
-                    .lineLimit(2)
-                    .foregroundStyle(Color.primary)
+                    .font(.system(.caption, design: .serif).weight(.bold))
+                    .lineLimit(2, reservesSpace: true)
+                    .foregroundStyle(Color.paperInk)
+                    .multilineTextAlignment(.leading)
 
-                Text(ByteCountFormatter.string(fromByteCount: book.fileSize, countStyle: .file))
-                    .font(.caption2)
-                    .foregroundStyle(Color.secondary)
+                Text(author.isEmpty ? " " : author)
+                    .font(.system(.caption2, design: .serif))
+                    .foregroundStyle(Color.paperRule)
+                    .lineLimit(1, reservesSpace: true)
+
+                HStack(spacing: 4) {
+                    Text(ByteCountFormatter.string(fromByteCount: book.fileSize, countStyle: .file))
+                        .font(.caption2)
+                        .foregroundStyle(Color.paperRule)
+
+                    Spacer(minLength: 0)
+
+                    BookStatusBadge(status: status)
+                        .animation(.easeInOut(duration: 0.2), value: status)
+                }
+                .frame(height: 14)
             }
-            .padding(.horizontal, 2)
+            .padding(.horizontal, 1)
         }
     }
 }
 
-// MARK: - Book Cover Placeholder
+// MARK: - Book Cover
 
 struct BookCoverView: View {
+    @Environment(BookStore.self) private var store
     let book: Book
 
-    var coverColor: Color {
-        let palette: [Color] = [
-            Color(red: 0.34, green: 0.24, blue: 0.71),
-            Color(red: 0.20, green: 0.42, blue: 0.78),
-            Color(red: 0.64, green: 0.22, blue: 0.61),
-            Color(red: 0.14, green: 0.56, blue: 0.52),
-            Color(red: 0.76, green: 0.33, blue: 0.14),
-            Color(red: 0.18, green: 0.54, blue: 0.30),
-            Color(red: 0.70, green: 0.17, blue: 0.34),
-            Color(red: 0.44, green: 0.29, blue: 0.13),
-        ]
+    private var topGray: Double {
         let hash = book.filename.unicodeScalars.reduce(UInt32(0)) { ($0 &* 31) &+ $1.value }
-        return palette[Int(hash % UInt32(palette.count))]
+        let values: [Double] = [0.94, 0.84, 0.68, 0.50]
+        return values[Int(hash % 4)]
+    }
+
+    private var coverImage: UIImage? {
+        guard let assetID = book.metadata.coverAssetID else { return nil }
+        let url = store.coverFileURL(for: assetID)
+        guard FileManager.default.fileExists(atPath: url.path),
+              let data = try? Data(contentsOf: url) else { return nil }
+        return UIImage(data: data)
     }
 
     var body: some View {
-        ZStack(alignment: .bottom) {
-            LinearGradient(
-                colors: [coverColor, coverColor.opacity(0.6)],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
+        GeometryReader { geo in
+            Group {
+                if let coverImage {
+                    Image(uiImage: coverImage)
+                        .resizable()
+                        .scaledToFill()
+                } else {
+                    ZStack(alignment: .bottom) {
+                        Color(white: topGray)
 
-            // Subtle stripe texture
-            VStack(spacing: 10) {
-                ForEach(0..<12, id: \.self) { _ in
-                    Rectangle()
-                        .fill(.white.opacity(0.04))
-                        .frame(height: 1)
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text(book.ext.uppercased())
+                                .font(.system(size: 7, weight: .heavy, design: .monospaced))
+                                .foregroundStyle(Color(white: 0.65))
+
+                            Text(book.displayTitle)
+                                .font(.system(size: 13, weight: .bold, design: .serif))
+                                .foregroundStyle(Color(white: 0.95))
+                                .lineLimit(3)
+                        }
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color(white: 0.07))
+                    }
                 }
             }
-            .frame(maxHeight: .infinity)
-
-            // Title + badge
-            VStack(alignment: .leading, spacing: 5) {
-                Text(book.displayTitle)
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(Color.white)
-                    .lineLimit(3)
-                    .shadow(color: .black.opacity(0.5), radius: 2)
-
-                Text(book.ext.uppercased())
-                    .font(.system(size: 9, weight: .bold))
-                    .foregroundStyle(Color.white.opacity(0.9))
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 2)
-                    .background(.white.opacity(0.22))
-                    .clipShape(RoundedRectangle(cornerRadius: 3))
-            }
-            .padding(12)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                LinearGradient(
-                    colors: [.clear, .black.opacity(0.48)],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-            )
+            .frame(width: geo.size.width, height: geo.size.height)
+            .clipped()
         }
         .aspectRatio(2.0 / 3.0, contentMode: .fit)
-        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .clipShape(RoundedRectangle(cornerRadius: 3))
         .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .stroke(.white.opacity(0.12), lineWidth: 0.5)
+            RoundedRectangle(cornerRadius: 3)
+                .stroke(Color.paperInk.opacity(0.14), lineWidth: 0.7)
         )
+    }
+}
+
+// MARK: - UUID + Identifiable sheet support
+
+extension UUID: @retroactive Identifiable {
+    public var id: UUID { self }
+}
+
+// MARK: - No match (filter rejects everything)
+
+struct NoMatchView: View {
+    let onReset: () -> Void
+
+    var body: some View {
+        VStack(spacing: 14) {
+            Spacer()
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 28, weight: .ultraLight))
+                .foregroundStyle(Color.paperRule)
+            Text("No books match these filters.")
+                .font(.system(.subheadline, design: .serif))
+                .foregroundStyle(Color.paperInk)
+            Button("Clear all", action: onReset)
+                .font(.system(.subheadline, design: .serif).weight(.bold))
+                .foregroundStyle(Color.paperInk)
+            Spacer()
+        }
     }
 }
 
@@ -180,37 +366,46 @@ struct BookCoverView: View {
 
 struct EmptyLibraryView: View {
     let onAdd: () -> Void
+    @State private var appeared = false
 
     var body: some View {
-        VStack(spacing: 24) {
-            Image(systemName: "books.vertical")
-                .font(.system(size: 72))
-                .foregroundStyle(
-                    Color.airBookAccent.opacity(0.5),
-                    Color.airBookAccent.opacity(0.25)
-                )
+        VStack(spacing: 0) {
+            Spacer()
 
-            VStack(spacing: 8) {
-                Text("Your Library is Empty")
-                    .font(.title3.weight(.semibold))
+            VStack(alignment: .leading, spacing: 0) {
+                Text("Your Library")
+                    .font(.system(.largeTitle, design: .serif).weight(.bold))
+                    .foregroundStyle(Color.paperInk)
 
-                Text("Import EPUB, TXT, or BMP files\nto send them to your CrossPoint.")
-                    .font(.subheadline)
-                    .foregroundStyle(Color.secondary)
-                    .multilineTextAlignment(.center)
+                Rectangle()
+                    .fill(Color.paperInk)
+                    .frame(height: 1)
+                    .padding(.top, 10)
+
+                Text("No books yet. Import EPUB, TXT, BMP or XTC files to send them wirelessly to your CrossPoint.")
+                    .font(.system(.subheadline, design: .serif))
+                    .foregroundStyle(Color.paperRule)
+                    .padding(.top, 12)
+
+                Button(action: onAdd) {
+                    Text("Add First Book")
+                        .font(.system(.headline, design: .serif))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .background(Color.paperInk)
+                        .foregroundStyle(Color.paperBackground)
+                }
+                .padding(.top, 24)
             }
+            .padding(.horizontal, 28)
+            .opacity(appeared ? 1 : 0)
+            .offset(y: appeared ? 0 : 14)
 
-            Button(action: onAdd) {
-                Label("Add Book", systemImage: "plus.circle.fill")
-                    .font(.headline)
-                    .padding(.horizontal, 28)
-                    .padding(.vertical, 14)
-                    .background(Color.airBookAccent)
-                    .foregroundStyle(Color.white)
-                    .clipShape(Capsule())
-            }
+            Spacer()
         }
-        .padding()
+        .onAppear {
+            withAnimation(.easeOut(duration: 0.45).delay(0.05)) { appeared = true }
+        }
     }
 }
 
@@ -244,17 +439,28 @@ struct DocumentPickerView: UIViewControllerRepresentable {
 // MARK: - Design Tokens
 
 extension Color {
-    // Warm parchment in light mode, system grouped background in dark mode
-    static let airBookBackground = Color(UIColor { t in
+    static let paperBackground = Color(UIColor { t in
         t.userInterfaceStyle == .dark
-            ? UIColor.systemGroupedBackground
-            : UIColor(red: 0.979, green: 0.961, blue: 0.938, alpha: 1)
+            ? UIColor(red: 0.09, green: 0.09, blue: 0.09, alpha: 1)
+            : UIColor(red: 0.976, green: 0.969, blue: 0.957, alpha: 1)
     })
 
-    // Deep purple in light mode, lighter purple in dark mode for legibility
-    static let airBookAccent = Color(UIColor { t in
+    static let paperInk = Color(UIColor { t in
         t.userInterfaceStyle == .dark
-            ? UIColor(red: 0.62, green: 0.52, blue: 0.92, alpha: 1)
-            : UIColor(red: 0.341, green: 0.243, blue: 0.710, alpha: 1)
+            ? UIColor(red: 0.91, green: 0.90, blue: 0.88, alpha: 1)
+            : UIColor(red: 0.08, green: 0.07, blue: 0.06, alpha: 1)
+    })
+
+    static let paperRule = Color(UIColor { t in
+        t.userInterfaceStyle == .dark
+            ? UIColor(red: 0.48, green: 0.46, blue: 0.44, alpha: 1)
+            : UIColor(red: 0.50, green: 0.48, blue: 0.45, alpha: 1)
+    })
+
+    // Muted amber — only for errors
+    static let paperError = Color(UIColor { t in
+        t.userInterfaceStyle == .dark
+            ? UIColor(red: 0.62, green: 0.44, blue: 0.16, alpha: 1)
+            : UIColor(red: 0.48, green: 0.28, blue: 0.05, alpha: 1)
     })
 }
