@@ -8,9 +8,11 @@ struct SyncView: View {
     @Environment(ReadingStateStore.self) private var readingStateStore
     @Environment(FirmwareUpdateManager.self) private var firmwareUpdater
     @Environment(FirmwareReleaseChecker.self) private var releaseChecker
+    @Environment(DeviceFileBrowser.self) private var deviceFileBrowser
     @Environment(\.dismiss) private var dismiss
 
     @State private var showingFirmwareUpdate = false
+    @State private var showingDeviceFiles = false
 
     var body: some View {
         NavigationStack {
@@ -39,7 +41,9 @@ struct SyncView: View {
                         latest: releaseChecker.latest,
                         syncPhase: sync.phase,
                         updaterPhase: firmwareUpdater.phase,
-                        onUpdate: { showingFirmwareUpdate = true })
+                        browserActive: deviceFileBrowser.phase.isActive,
+                        onUpdate: { showingFirmwareUpdate = true },
+                        onBrowse: { showingDeviceFiles = true })
                         .padding(.horizontal, 24)
                         .padding(.vertical, 14)
 
@@ -101,6 +105,10 @@ struct SyncView: View {
                                        currentDeviceVersion: firmwareUpdater.deviceInfo?.version)
                         .environment(firmwareUpdater)
                 }
+            }
+            .sheet(isPresented: $showingDeviceFiles) {
+                DeviceFilesView()
+                    .environment(deviceFileBrowser)
             }
             .task {
                 // Fire-and-forget the GitHub Releases fetch — fails open
@@ -442,7 +450,11 @@ private struct DeviceFirmwarePanel: View {
     /// FirmwareUpdateManager phase — used to disable the Update button
     /// while an OTA is in flight on a different sheet.
     let updaterPhase: FirmwareUpdatePhase
+    /// True when the file browser is using BLE — disable Sync/Update
+    /// related actions so we don't fight for the same peripheral.
+    let browserActive: Bool
     let onUpdate: () -> Void
+    let onBrowse: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -488,23 +500,54 @@ private struct DeviceFirmwarePanel: View {
     }
 
     private func foundRow(info: DeviceFirmwareInfo) -> some View {
-        HStack(spacing: 10) {
-            Image(systemName: "cube")
-                .font(.system(size: 14, weight: .light))
-                .foregroundStyle(Color.paperInk)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("CrossPoint AirBook")
-                    .font(.system(.subheadline, design: .serif).weight(.bold))
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Image(systemName: "cube")
+                    .font(.system(size: 14, weight: .light))
                     .foregroundStyle(Color.paperInk)
-                Text("Firmware \(info.version.isEmpty ? "—" : info.version)")
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(Color.paperRule)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("CrossPoint AirBook")
+                        .font(.system(.subheadline, design: .serif).weight(.bold))
+                        .foregroundStyle(Color.paperInk)
+                    Text("Firmware \(info.version.isEmpty ? "—" : info.version)")
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(Color.paperRule)
+                }
+                Spacer()
+                if shouldOfferUpdate(for: info) {
+                    updateButton
+                }
             }
-            Spacer()
-            if shouldOfferUpdate(for: info) {
-                updateButton
+            if shouldOfferBrowse(for: info) {
+                browseButton
             }
         }
+    }
+
+    private func shouldOfferBrowse(for info: DeviceFirmwareInfo) -> Bool {
+        info.capabilities.contains("browse")
+    }
+
+    @ViewBuilder
+    private var browseButton: some View {
+        Button(action: onBrowse) {
+            HStack(spacing: 8) {
+                Image(systemName: "tray.full")
+                    .font(.system(size: 11, weight: .light))
+                Text("Browse files on device")
+                    .font(.system(.caption, design: .monospaced).weight(.medium))
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .light))
+            }
+            .foregroundStyle(Color.paperInk)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity)
+            .overlay(Rectangle().stroke(Color.paperRule.opacity(0.4), lineWidth: 0.5))
+        }
+        .disabled(syncPhase.isActive || updaterPhase.isActive || browserActive)
+        .opacity((syncPhase.isActive || updaterPhase.isActive || browserActive) ? 0.4 : 1)
     }
 
     private var legacyRow: some View {

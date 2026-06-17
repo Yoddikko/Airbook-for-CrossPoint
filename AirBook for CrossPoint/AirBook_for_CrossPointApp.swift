@@ -9,6 +9,7 @@ struct AirBook_for_CrossPointApp: App {
     @State private var zlib = ZLibService()
     @State private var firmwareReleaseChecker = FirmwareReleaseChecker()
     @State private var firmwareUpdater = FirmwareUpdateManager()
+    @State private var deviceFileBrowser = DeviceFileBrowser()
 
     var body: some Scene {
         WindowGroup {
@@ -20,6 +21,7 @@ struct AirBook_for_CrossPointApp: App {
                 .environment(zlib)
                 .environment(firmwareReleaseChecker)
                 .environment(firmwareUpdater)
+                .environment(deviceFileBrowser)
         }
     }
 }

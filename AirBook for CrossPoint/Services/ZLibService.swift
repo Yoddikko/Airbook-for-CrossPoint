@@ -135,6 +135,30 @@ private enum ZLibKeychain {
     }
 }
 
+// MARK: - Backgroundable download status
+
+enum ZLibDownloadStatus: Equatable {
+    case idle
+    case downloading(book: ZLibSearchResult, receivedBytes: Int64, totalBytes: Int64)
+    case importing(book: ZLibSearchResult)
+    case completed(book: ZLibSearchResult, importedBookID: UUID)
+    case failed(book: ZLibSearchResult, message: String)
+
+    var isActive: Bool {
+        switch self {
+        case .downloading, .importing: return true
+        default: return false
+        }
+    }
+
+    var inProgressBook: ZLibSearchResult? {
+        switch self {
+        case .downloading(let b, _, _), .importing(let b): return b
+        default: return nil
+        }
+    }
+}
+
 // MARK: - ZLibService
 //
 // Personal-use Z-Library client implementing the subset of the heartleo/zlib
@@ -160,6 +184,11 @@ final class ZLibService {
     var isLoggedIn: Bool = false
     var savedEmail: String = ""
     var limits: ZLibLimits?
+    /// Backgroundable download status. State lives in the service so a
+    /// download survives the user dismissing DiscoverBookSheet — the
+    /// sheet just observes this property and re-acquires the UI on
+    /// re-open. `idle` means free to start a new one.
+    var activeDownload: ZLibDownloadStatus = .idle
 
     // MARK: - Private
 
@@ -866,5 +895,79 @@ final class ZLibService {
             }
         }
         return out
+    }
+}
+
+// MARK: - Backgroundable downloads
+//
+// The original startDownload lived inside DiscoverBookSheet's @State, so a
+// user dismissing the sheet either cancelled the Task or left it orphaned
+// with no way to surface completion. These two methods move the state into
+// the service itself: the sheet observes `activeDownload`, and the user can
+// close the sheet at any time — the download keeps running in the
+// background, imports into BookStore on success, and reports the result
+// through `activeDownload` for any view that wants to listen.
+
+extension ZLibService {
+    /// Kick off a download + import as a background task tied to the
+    /// service's lifetime (not to a transient view). Becomes a no-op if
+    /// another download is already in flight — callers can check
+    /// `activeDownload.isActive` first.
+    func startBackgroundDownload(seed: ZLibSearchResult,
+                                  detail: ZLibBookDetail,
+                                  into store: BookStore) {
+        guard !activeDownload.isActive else { return }
+        guard let url = detail.downloadURL else {
+            activeDownload = .failed(book: seed, message: "No download link.")
+            return
+        }
+        activeDownload = .downloading(book: seed, receivedBytes: 0, totalBytes: 0)
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("zlib_download", isDirectory: true)
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let fileURL = try await self.download(downloadURL: url,
+                                                       destinationDir: tempDir) { done, total in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        if case .downloading(let book, _, _) = self.activeDownload {
+                            self.activeDownload = .downloading(book: book,
+                                                                receivedBytes: done,
+                                                                totalBytes: total)
+                        }
+                    }
+                }
+                await MainActor.run {
+                    self.activeDownload = .importing(book: seed)
+                }
+                let imported = try await MainActor.run {
+                    try store.importBook(from: fileURL)
+                }
+                try? FileManager.default.removeItem(at: fileURL)
+                Task { try? await self.fetchLimits() }
+                await MainActor.run {
+                    self.activeDownload = .completed(book: seed,
+                                                     importedBookID: imported.id)
+                }
+            } catch {
+                await MainActor.run {
+                    self.activeDownload = .failed(book: seed,
+                                                  message: error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    /// Reset back to .idle so a new download can start. Called by the UI
+    /// after the user has seen the completed/failed banner.
+    func acknowledgeDownload() {
+        // Don't clobber a running download — only ack terminal states.
+        switch activeDownload {
+        case .completed, .failed:
+            activeDownload = .idle
+        default:
+            break
+        }
     }
 }

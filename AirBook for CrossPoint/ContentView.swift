@@ -11,6 +11,7 @@ struct ContentView: View {
     @Environment(ZLibService.self) private var zlib
     @Environment(FirmwareUpdateManager.self) private var firmwareUpdater
     @Environment(FirmwareReleaseChecker.self) private var firmwareReleaseChecker
+    @Environment(DeviceFileBrowser.self) private var deviceFileBrowser
     @State private var showingPicker = false
     @State private var showingSync = false
     @State private var showingDiscover = false
@@ -128,6 +129,7 @@ struct ContentView: View {
                 .environment(readingStateStore)
                 .environment(firmwareUpdater)
                 .environment(firmwareReleaseChecker)
+                .environment(deviceFileBrowser)
         }
         .sheet(isPresented: $showingDiscover) {
             DiscoverView()

@@ -105,6 +105,98 @@ struct DiscoverView: View {
             } else {
                 resultList
             }
+
+            // Persistent background-download status. Visible whenever the
+            // service is mid-download or has a terminal result that
+            // hasn't been acknowledged yet — so dismissing the book
+            // detail sheet doesn't lose visibility into what's happening.
+            backgroundDownloadFooter
+        }
+    }
+
+    @ViewBuilder
+    private var backgroundDownloadFooter: some View {
+        switch service.activeDownload {
+        case .downloading(let book, let done, let total):
+            backgroundFooterRow(
+                book: book,
+                title: total > 0 ? "Downloading · \(Int((Double(done) / Double(total)) * 100))%"
+                                 : "Downloading…",
+                tint: Color.paperInk,
+                fraction: total > 0 ? Double(done) / Double(total) : nil)
+        case .importing(let book):
+            backgroundFooterRow(
+                book: book,
+                title: "Importing into library…",
+                tint: Color.paperInk,
+                fraction: nil)
+        case .completed(let book, _):
+            backgroundFooterRow(
+                book: book,
+                title: "Saved to library",
+                tint: Color.paperInk,
+                fraction: 1,
+                trailing: dismissButton())
+        case .failed(let book, let msg):
+            backgroundFooterRow(
+                book: book,
+                title: "Download failed: \(msg)",
+                tint: Color.paperError,
+                fraction: nil,
+                trailing: dismissButton())
+        case .idle:
+            EmptyView()
+        }
+    }
+
+    private func backgroundFooterRow(book: ZLibSearchResult,
+                                      title: String,
+                                      tint: Color,
+                                      fraction: Double?,
+                                      trailing: (some View)? = Optional<EmptyView>.none) -> some View {
+        VStack(spacing: 0) {
+            Rectangle().fill(Color.paperInk.opacity(0.12)).frame(height: 0.5)
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.system(.caption2, design: .monospaced).weight(.medium))
+                        .foregroundStyle(tint)
+                    Text(book.title)
+                        .font(.system(.footnote, design: .serif))
+                        .foregroundStyle(Color.paperInk)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 8)
+                if let trailing {
+                    trailing
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 10)
+
+            if let fraction {
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        Rectangle().fill(Color.paperRule.opacity(0.18))
+                        Rectangle().fill(tint)
+                            .frame(width: geo.size.width * CGFloat(max(0, min(1, fraction))))
+                            .animation(.linear(duration: 0.4), value: fraction)
+                    }
+                }
+                .frame(height: 2)
+            }
+        }
+        .background(Color.paperBackground)
+    }
+
+    private func dismissButton() -> some View {
+        Button {
+            service.acknowledgeDownload()
+        } label: {
+            Image(systemName: "xmark")
+                .font(.system(size: 11, weight: .light))
+                .foregroundStyle(Color.paperRule)
+                .frame(width: 24, height: 24)
         }
     }
 
@@ -519,12 +611,23 @@ struct DiscoverBookSheet: View {
     @State private var detail: ZLibBookDetail?
     @State private var loading: Bool = true
     @State private var errorMessage: String?
-    @State private var downloading: Bool = false
-    @State private var downloadProgress: Double = 0
-    @State private var downloadedBytes: Int64 = 0
-    @State private var downloadTotalBytes: Int64 = 0
-    @State private var downloadError: String?
-    @State private var importedBook: Book?
+
+    // Whether the sheet should show progress for THIS book specifically.
+    // True if service.activeDownload concerns `seed`. Lets the user open
+    // a different book detail without seeing the wrong progress, and lets
+    // them re-open the SAME book mid-download to see live progress.
+    private var isThisDownloadActive: Bool {
+        guard let book = service.activeDownload.inProgressBook else { return false }
+        return book.id == seed.id
+    }
+    private var thisDownloadResult: ZLibDownloadStatus? {
+        switch service.activeDownload {
+        case .completed(let b, _) where b.id == seed.id, .failed(let b, _) where b.id == seed.id:
+            return service.activeDownload
+        default:
+            return nil
+        }
+    }
 
     var body: some View {
         NavigationStack {
@@ -541,7 +644,11 @@ struct DiscoverBookSheet: View {
                             synopsisSection(synopsis)
                         }
                         downloadSection
-                        if let importedBook { successBlock(importedBook) }
+                        if let result = thisDownloadResult,
+                           case .completed(_, let id) = result,
+                           let book = store.books.first(where: { $0.id == id }) {
+                            successBlock(book)
+                        }
                     }
                     .padding(.horizontal, 24)
                     .padding(.top, 8)
@@ -555,16 +662,18 @@ struct DiscoverBookSheet: View {
                         .foregroundStyle(Color.paperInk)
                 }
                 ToolbarItem(placement: .topBarLeading) {
+                    // Close is always enabled — the download moved into
+                    // ZLibService so dismissing the sheet just hides the
+                    // UI. The download keeps running and surfaces on
+                    // re-entry (or on the global Discover view footer).
                     Button("Close") { dismiss() }
                         .font(.system(.subheadline, design: .serif))
                         .foregroundStyle(Color.paperInk)
-                        .disabled(downloading)
                 }
             }
             .toolbarBackground(Color.paperBackground, for: .navigationBar)
             .toolbarBackground(.visible, for: .navigationBar)
             .navigationBarTitleDisplayMode(.inline)
-            .interactiveDismissDisabled(downloading)
         }
         .onAppear(perform: loadDetail)
     }
@@ -641,22 +750,44 @@ struct DiscoverBookSheet: View {
         let canImport = supportedByLibrary(detail?.ext ?? seed.ext)
         let hasLink = detail?.downloadURL != nil
 
-        if downloading {
-            VStack(spacing: 8) {
-                ProgressView(value: downloadProgress)
-                    .tint(Color.paperInk)
-                HStack {
-                    Text(progressLabel)
-                        .font(.system(.caption2, design: .monospaced))
-                        .foregroundStyle(Color.paperRule)
-                    Spacer()
-                    Text("\(Int(downloadProgress * 100))%")
-                        .font(.system(.caption2, design: .monospaced))
+        if isThisDownloadActive {
+            // Live progress for this book. Reads straight from
+            // service.activeDownload so the bar keeps moving even if the
+            // sheet was just re-opened mid-download.
+            switch service.activeDownload {
+            case .downloading(_, let done, let total):
+                let p = total > 0 ? Double(done) / Double(total) : 0
+                VStack(spacing: 8) {
+                    ProgressView(value: max(0, min(1, p)))
+                        .tint(Color.paperInk)
+                    HStack {
+                        Text(byteProgressLabel(done: done, total: total))
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(Color.paperRule)
+                        Spacer()
+                        Text("\(Int(p * 100))%")
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(Color.paperInk)
+                    }
+                }
+                .padding(.vertical, 4)
+            case .importing:
+                HStack(spacing: 8) {
+                    ProgressView().scaleEffect(0.6).tint(Color.paperInk)
+                    Text("Importing into library…")
+                        .font(.system(.caption, design: .monospaced))
                         .foregroundStyle(Color.paperInk)
                 }
+                .padding(.vertical, 6)
+            default:
+                EmptyView()
             }
-            .padding(.vertical, 4)
-        } else if importedBook == nil {
+        } else if thisDownloadResult == nil {
+            // No active or completed download for this book → show the
+            // start button. If a DIFFERENT book is currently downloading,
+            // gate the button so we don't queue parallel downloads.
+            let blockedByOther = service.activeDownload.isActive
+
             Button {
                 startDownload()
             } label: {
@@ -668,13 +799,19 @@ struct DiscoverBookSheet: View {
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 14)
-                .background(canImport && hasLink ? Color.paperInk : Color.paperRule.opacity(0.3))
-                .foregroundStyle(canImport && hasLink ? Color.paperBackground : Color.paperInk.opacity(0.5))
+                .background(canImport && hasLink && !blockedByOther ? Color.paperInk : Color.paperRule.opacity(0.3))
+                .foregroundStyle(canImport && hasLink && !blockedByOther ? Color.paperBackground : Color.paperInk.opacity(0.5))
             }
-            .disabled(!canImport || !hasLink || loading)
+            .disabled(!canImport || !hasLink || loading || blockedByOther)
             .padding(.top, 8)
 
-            if !canImport, let ext = (detail?.ext ?? seed.ext).nonEmpty {
+            if blockedByOther, let other = service.activeDownload.inProgressBook {
+                Text("Already downloading \"\(other.title)\" in the background.")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(Color.paperRule)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
+            } else if !canImport, let ext = (detail?.ext ?? seed.ext).nonEmpty {
                 Text("Format .\(ext.lowercased()) isn't supported by your CrossPoint yet. EPUB, TXT, BMP, XTC, XTCH only.")
                     .font(.system(.caption2, design: .monospaced))
                     .foregroundStyle(Color.paperError)
@@ -689,13 +826,22 @@ struct DiscoverBookSheet: View {
             }
         }
 
-        if let downloadError {
-            Text(downloadError)
+        if case .failed(_, let message) = thisDownloadResult ?? .idle {
+            Text(message)
                 .font(.system(.caption, design: .monospaced))
                 .foregroundStyle(Color.paperError)
                 .multilineTextAlignment(.center)
                 .padding(.top, 6)
         }
+    }
+
+    private func byteProgressLabel(done: Int64, total: Int64) -> String {
+        if total > 0 {
+            let d = ByteCountFormatter.string(fromByteCount: done, countStyle: .file)
+            let t = ByteCountFormatter.string(fromByteCount: total, countStyle: .file)
+            return "\(d) / \(t)"
+        }
+        return ByteCountFormatter.string(fromByteCount: done, countStyle: .file)
     }
 
     private func successBlock(_ book: Book) -> some View {
@@ -767,53 +913,11 @@ struct DiscoverBookSheet: View {
     }
 
     private func startDownload() {
-        guard let url = detail?.downloadURL else { return }
-        downloading = true
-        downloadError = nil
-        downloadProgress = 0
-        downloadedBytes = 0
-        downloadTotalBytes = 0
-
-        let tempDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("zlib_download", isDirectory: true)
-        Task {
-            do {
-                let fileURL = try await service.download(downloadURL: url,
-                                                         destinationDir: tempDir) { done, total in
-                    Task { @MainActor in
-                        downloadedBytes = done
-                        downloadTotalBytes = total
-                        if total > 0 {
-                            downloadProgress = min(1.0, Double(done) / Double(total))
-                        }
-                    }
-                }
-                // Import into AirBook library via BookStore.
-                let imported = try store.importBook(from: fileURL)
-                try? FileManager.default.removeItem(at: fileURL)
-                Task { try? await service.fetchLimits() }
-
-                await MainActor.run {
-                    importedBook = imported
-                    downloading = false
-                    downloadProgress = 1.0
-                }
-            } catch {
-                await MainActor.run {
-                    downloading = false
-                    downloadError = error.localizedDescription
-                }
-            }
-        }
-    }
-
-    private var progressLabel: String {
-        if downloadTotalBytes > 0 {
-            let done = ByteCountFormatter.string(fromByteCount: downloadedBytes, countStyle: .file)
-            let total = ByteCountFormatter.string(fromByteCount: downloadTotalBytes, countStyle: .file)
-            return "\(done) / \(total)"
-        }
-        return ByteCountFormatter.string(fromByteCount: downloadedBytes, countStyle: .file)
+        guard let detail else { return }
+        // Delegate to the service so the download survives the sheet
+        // being dismissed mid-flight. The view just observes
+        // service.activeDownload from here on.
+        service.startBackgroundDownload(seed: seed, detail: detail, into: store)
     }
 
     private func downloadButtonLabel(hasLink: Bool, canImport: Bool) -> String {
